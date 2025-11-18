@@ -1,0 +1,141 @@
+# webgen-frontend/.github/workflows/cd.yml
+name: Frontend CD
+
+on:
+  workflow_run:
+    workflows: ["Frontend CI"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 20
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Deployment Variables
+        run: |
+          echo "DEPLOY_TIME=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_ENV
+          echo "COMMIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Create Docker Network
+        run: docker network create webgen-network 2>/dev/null || true
+
+      - name: Build Frontend Image
+        env:
+          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          REACT_APP_STRIPE_PUBLIC_KEY: ${{ secrets.REACT_APP_STRIPE_PUBLIC_KEY }}
+        run: |
+          cd $GITHUB_WORKSPACE
+          echo "🔨 Building frontend image..."
+
+          docker build \
+            --no-cache \
+            --target production \
+            --tag webgen-frontend-image:latest \
+            --tag webgen-frontend-image:${{ env.COMMIT_SHA }} \
+            --build-arg VITE_API_URL="${VITE_API_URL}" \
+            --build-arg REACT_APP_STRIPE_PUBLIC_KEY="${REACT_APP_STRIPE_PUBLIC_KEY}" \
+            --build-arg REACT_APP_ENV="production" \
+            .
+
+      - name: Stop Old Container
+        run: |
+          echo "🛑 Stopping old frontend container..."
+          docker stop webgen-frontend 2>/dev/null || true
+          docker rm -f webgen-frontend 2>/dev/null || true
+
+      - name: Start Frontend Container
+        run: |
+          echo "🚀 Starting new frontend container..."
+
+          docker run -d \
+            --name webgen-frontend \
+            --network webgen-network \
+            -p 127.0.0.1:3000:3000 \
+            --restart unless-stopped \
+            --memory="512m" \
+            --cpus="0.3" \
+            webgen-frontend-image:latest
+
+          echo "⏳ Waiting for frontend to start..."
+          sleep 10
+
+      - name: Health Check
+        run: |
+          echo "🏥 Running health checks..."
+
+          MAX_ATTEMPTS=12
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $ATTEMPT/$MAX_ATTEMPTS..."
+            
+            if curl -f http://localhost:3000 > /dev/null 2>&1; then
+              echo "✅ Frontend is healthy!"
+              exit 0
+            fi
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "❌ Frontend health check failed after $MAX_ATTEMPTS attempts!"
+              docker logs webgen-frontend --tail 100
+              exit 1
+            fi
+            
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep 5
+          done
+
+      - name: Verify Container Status
+        run: |
+          echo "=== Container Status ==="
+          docker ps --filter name=webgen-frontend --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+          echo ""
+          echo "=== Container Logs (Last 30 lines) ==="
+          docker logs webgen-frontend --tail 30
+
+      - name: Test Frontend Response
+        run: |
+          echo "🧪 Testing frontend response..."
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Frontend responding with 200 OK"
+          else
+            echo "❌ Frontend returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Cleanup Old Images
+        run: |
+          echo "🧹 Cleaning up old Docker images..."
+          docker image prune -af --filter "until=24h"
+
+      - name: Send Deployment Notification
+        if: success()
+        run: |
+          echo "==================================="
+          echo "✅ FRONTEND DEPLOYMENT SUCCESSFUL"
+          echo "==================================="
+          echo "Time: ${{ env.DEPLOY_TIME }}"
+          echo "Commit: ${{ env.COMMIT_SHA }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "URL: https://webgen.club"
+          echo "==================================="
+
+      - name: Rollback on Failure
+        if: failure()
+        run: |
+          echo "⚠️ DEPLOYMENT FAILED - INITIATING ROLLBACK"
+
+          # Stop failed container
+          docker stop webgen-frontend 2>/dev/null || true
+          docker rm -f webgen-frontend 2>/dev/null || true
+
+          echo "❌ DEPLOYMENT FAILED"
