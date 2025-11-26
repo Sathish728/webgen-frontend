@@ -101,7 +101,7 @@ const handleCancel = async (immediate = false) => {
     setCancelLoading(false);
   }
 };
-  const BASIC_PRICE_ID = "price_1STHnwSAuDC0KFi5jI4jIM3T";
+  const BASIC_PRICE_ID = "price_1Ru5oUSAuDC0KFi5PwnG4FX5";
 
   return (
     <div className="min-h-screen bg-gray-50 py-12 px-4">
